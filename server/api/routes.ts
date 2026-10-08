@@ -43,31 +43,77 @@ router.get('/documents', (req: Request, res: Response) => {
   res.json({ documents: docs });
 });
 
-// POST /api/documents/upload
-router.post('/documents/upload', upload.single('file'), async (req: Request, res: Response) => {
+// Safe multer upload middleware to catch file upload errors gracefully as JSON
+const handleFileUpload = (req: Request, res: Response, next: express.NextFunction) => {
+  upload.any()(req, res, (err: any) => {
+    if (err) {
+      console.error('[file upload failure]:', err?.message || err);
+      return res.status(400).setHeader('Content-Type', 'application/json').json({
+        success: false,
+        error: 'file upload failure',
+        details: err?.message || 'Multipart form upload error',
+      });
+    }
+    next();
+  });
+};
+
+// POST /api/documents/upload & /api/upload alias
+const uploadHandler = async (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'application/json');
+
   try {
     let filename = 'document.pdf';
     let buffer: Buffer | undefined;
-    let size = 10240;
+    let size = 0;
+    let mimeType = 'application/octet-stream';
 
-    if (req.file) {
-      filename = req.file.originalname;
-      buffer = req.file.buffer;
-      size = req.file.size;
-    } else if (req.body.filename) {
+    const uploadedFile = (req.files && Array.isArray(req.files) && req.files.length > 0)
+      ? req.files[0]
+      : req.file;
+
+    if (uploadedFile) {
+      filename = uploadedFile.originalname;
+      buffer = uploadedFile.buffer;
+      size = uploadedFile.size;
+      mimeType = uploadedFile.mimetype || 'application/octet-stream';
+    } else if (req.body && req.body.filename) {
       filename = req.body.filename;
-      size = req.body.fileSize || 10240;
+      size = req.body.fileSize || (req.body.content ? Buffer.byteLength(req.body.content) : 10240);
+      mimeType = req.body.mimeType || 'application/octet-stream';
+      if (req.body.content) {
+        buffer = Buffer.from(req.body.content, 'utf-8');
+      }
+    } else {
+      console.error('[file upload failure]: No file provided in request payload');
+      return res.status(400).setHeader('Content-Type', 'application/json').json({
+        success: false,
+        error: 'file upload failure',
+        details: 'No document file was detected in the request. Please provide a file under the "file" field.',
+      });
     }
 
-    const detected = detectFileType(filename, req.file?.mimetype, buffer);
+    console.log(`[Upload Request] Received file: "${filename}", size: ${size} bytes, mime: "${mimeType}"`);
+
+    const detected = detectFileType(filename, mimeType, buffer);
+    console.log(`[File Type Detection] Detected format: "${detected.format}", supported: ${detected.isSupported}`);
 
     if (!detected.isSupported) {
-      return res.status(400).json({
-        status: 'error',
-        error_type: 'unsupported_format',
-        message: `The format .${detected.format} is not supported. Supported formats include PDF, DOCX, XLSX, PPTX, CSV, JPG, PNG, TIFF, HEIC, HTML, EML, etc.`,
+      console.warn(`[Upload Error - unsupported format]: Format .${detected.format} is not supported`);
+      return res.status(400).setHeader('Content-Type', 'application/json').json({
+        success: false,
+        error: 'Unsupported file format',
+        details: `The format .${detected.format} is not supported. Supported formats include PDF, DOCX, XLSX, PPTX, CSV, JPG, PNG, TIFF, HEIC, HTML, Markdown, TXT, etc.`,
         filename,
       });
+    }
+
+    // Check Gemini API key status on server side
+    const geminiStatus = geminiService.getStatus();
+    if (!geminiStatus.keyConfigured) {
+      console.log('[missing Gemini API key] GEMINI_API_KEY environment variable is not configured or empty');
+    } else {
+      console.log(`[Upload - Gemini check]: Model: ${geminiStatus.model}, Key configured: YES`);
     }
 
     const docId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -95,20 +141,60 @@ router.post('/documents/upload', upload.single('file'), async (req: Request, res
       : undefined;
 
     const result = await parsingPipeline.processDocument(newDoc, buffer, fileTextContent);
-    return res.status(201).json({
+
+    const tableBlocks = result.blocks.filter(b => b.type === 'table');
+    const figureBlocks = result.blocks.filter(b => b.type === 'figure');
+    const equationBlocks = result.blocks.filter(b => b.type === 'equation');
+
+    console.log(`[Upload Success] Document "${filename}" parsed into ${result.blocks.length} blocks across ${result.pages.length} pages.`);
+
+    return res.status(200).setHeader('Content-Type', 'application/json').json({
       success: true,
-      document: result.document,
+      message: 'Document processed successfully',
       resultId: result.document.id,
+      document: {
+        id: result.document.id,
+        filename: result.document.filename,
+        type: result.document.format,
+        size: `${(result.document.fileSize / 1024).toFixed(1)} KB`,
+        fileSize: result.document.fileSize,
+        pages: result.document.pages,
+        totalBlocks: result.document.totalBlocks,
+        averageConfidence: result.document.averageConfidence,
+        needsReviewCount: result.document.needsReviewCount,
+        geminiUsed: result.document.geminiUsed,
+        geminiStatus: result.document.geminiStatus,
+        uploadedAt: result.document.uploadedAt,
+      },
+      result: {
+        document: result.document,
+        pages: result.pages,
+        blocks: result.blocks,
+        markdown: result.markdown,
+        json: {
+          document: result.document,
+          pages: result.pages,
+          blocks: result.blocks,
+        },
+        tables: tableBlocks,
+        figures: figureBlocks,
+        equations: equationBlocks,
+        summary: result.summary,
+        crossPageTablesMergedCount: result.crossPageTablesMergedCount,
+      },
     });
   } catch (err: any) {
-    console.error('Upload & parse error:', err);
-    return res.status(500).json({
-      status: 'error',
-      error_type: 'processing_failure',
-      message: err?.message || 'Failed to process document',
+    console.error('[Upload Error - Document processing failed]:', err?.message || err);
+    return res.status(500).setHeader('Content-Type', 'application/json').json({
+      success: false,
+      error: 'Document processing failed',
+      details: err?.message || 'An unexpected error occurred while parsing the document.',
     });
   }
-});
+};
+
+router.post('/documents/upload', handleFileUpload, uploadHandler);
+router.post('/upload', handleFileUpload, uploadHandler);
 
 // GET /api/documents/:id
 router.get('/documents/:id', (req: Request, res: Response) => {
@@ -162,7 +248,11 @@ router.get('/documents/:id/result', (req: Request, res: Response) => {
 router.get('/documents/:id/markdown', (req: Request, res: Response) => {
   const result = documentStore.getResult(req.params.id);
   if (!result) {
-    return res.status(404).send('Document not found');
+    return res.status(404).setHeader('Content-Type', 'application/json').json({
+      success: false,
+      error: 'Document not found',
+      details: 'No document found with the specified ID',
+    });
   }
   res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${result.document.filename}.md"`);
@@ -173,7 +263,11 @@ router.get('/documents/:id/markdown', (req: Request, res: Response) => {
 router.get('/documents/:id/json', (req: Request, res: Response) => {
   const result = documentStore.getResult(req.params.id);
   if (!result) {
-    return res.status(404).json({ error: 'Document not found' });
+    return res.status(404).setHeader('Content-Type', 'application/json').json({
+      success: false,
+      error: 'Document not found',
+      details: 'No document found with the specified ID',
+    });
   }
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', `attachment; filename="${result.document.filename}.json"`);
@@ -184,7 +278,11 @@ router.get('/documents/:id/json', (req: Request, res: Response) => {
 router.get('/documents/:id/export/zip', async (req: Request, res: Response) => {
   const result = documentStore.getResult(req.params.id);
   if (!result) {
-    return res.status(404).send('Document not found');
+    return res.status(404).setHeader('Content-Type', 'application/json').json({
+      success: false,
+      error: 'Document not found',
+      details: 'No document found with the specified ID',
+    });
   }
 
   try {
@@ -211,7 +309,11 @@ router.get('/documents/:id/export/zip', async (req: Request, res: Response) => {
     res.setHeader('Content-Disposition', `attachment; filename="${result.document.filename}_parsed.zip"`);
     return res.send(zipBuffer);
   } catch (err: any) {
-    return res.status(500).send('Error generating ZIP export');
+    return res.status(500).setHeader('Content-Type', 'application/json').json({
+      success: false,
+      error: 'Export failed',
+      details: err?.message || 'Error generating ZIP export',
+    });
   }
 });
 

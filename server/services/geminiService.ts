@@ -1,3 +1,6 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
 import { GoogleGenAI } from '@google/genai';
 import { ChartDataPoint } from '../types.js';
 
@@ -28,38 +31,65 @@ class GeminiService {
   private isAvailable: boolean = false;
 
   constructor() {
-    this.initClient();
+    this.ensureClient();
   }
 
-  private initClient() {
+  private ensureClient(): GoogleGenAI | null {
     const apiKey = process.env.GEMINI_API_KEY;
     if (apiKey && apiKey.trim().length > 0 && apiKey !== 'MY_GEMINI_API_KEY') {
-      try {
-        this.ai = new GoogleGenAI({
-          apiKey,
-          httpOptions: {
-            headers: {
-              'User-Agent': 'aistudio-build',
+      if (!this.ai) {
+        try {
+          this.ai = new GoogleGenAI({
+            apiKey: apiKey.trim(),
+            httpOptions: {
+              headers: {
+                'User-Agent': 'aistudio-build',
+              },
             },
-          },
-        });
-        this.isAvailable = true;
-      } catch (err) {
-        console.warn('Gemini client initialization failed:', err);
-        this.ai = null;
-        this.isAvailable = false;
+          });
+          this.isAvailable = true;
+          console.log('[Gemini API key check]: Successfully initialized GoogleGenAI with backend key.');
+        } catch (err: any) {
+          console.error('[Gemini API failure]: Failed to initialize client:', err?.message || err);
+          this.ai = null;
+          this.isAvailable = false;
+        }
       }
+      return this.ai;
     } else {
       this.isAvailable = false;
+      this.ai = null;
+      console.log('[missing Gemini API key] GEMINI_API_KEY is not configured or empty. Operating in fallback mode.');
+      return null;
     }
   }
 
   public getStatus(): { available: boolean; model: string; keyConfigured: boolean } {
+    const client = this.ensureClient();
     return {
-      available: this.isAvailable,
+      available: Boolean(client),
       model: 'gemini-3.8-flash',
       keyConfigured: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
     };
+  }
+
+  /**
+   * Helper to execute Gemini with a strict timeout to avoid hung upload requests
+   */
+  private async executeWithTimeout<T>(promise: Promise<T>, timeoutMs: number = 10000): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) =>
+        setTimeout(() => reject(new Error(`Gemini API call timed out after ${timeoutMs}ms`)), timeoutMs)
+      ),
+    ]);
+  }
+
+  private cleanJsonString(str: string): string {
+    return str
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
   }
 
   /**
@@ -69,7 +99,9 @@ class GeminiService {
     descriptionOrText: string,
     imageSnippetBase64?: string
   ): Promise<{ success: boolean; result?: ChartExtractionResult; fallbackUsed: boolean; error?: string }> {
-    if (!this.isAvailable || !this.ai) {
+    const client = this.ensureClient();
+    if (!client) {
+      console.log('[missing Gemini API key]: GEMINI_API_KEY not configured. Using deterministic extractor.');
       return {
         success: false,
         fallbackUsed: true,
@@ -111,7 +143,7 @@ If precise values cannot be confidently extracted, assign a lower confidence (<0
         };
       }
 
-      const response = await this.ai.models.generateContent({
+      const responsePromise = client.models.generateContent({
         model: 'gemini-3.8-flash',
         contents,
         config: {
@@ -120,15 +152,26 @@ If precise values cannot be confidently extracted, assign a lower confidence (<0
         },
       });
 
+      const response = await this.executeWithTimeout(responsePromise, 8000);
       const text = response.text || '';
-      const parsed = JSON.parse(text) as ChartExtractionResult;
-      return {
-        success: true,
-        result: parsed,
-        fallbackUsed: false,
-      };
+      try {
+        const cleaned = this.cleanJsonString(text);
+        const parsed = JSON.parse(cleaned) as ChartExtractionResult;
+        return {
+          success: true,
+          result: parsed,
+          fallbackUsed: false,
+        };
+      } catch (parseErr: any) {
+        console.error('[JSON parsing failure]: Failed to parse Gemini chart response as JSON:', parseErr?.message || parseErr);
+        return {
+          success: false,
+          fallbackUsed: true,
+          error: 'JSON parsing failure on Gemini response',
+        };
+      }
     } catch (err: any) {
-      console.error('Gemini chart extraction error:', err?.message || err);
+      console.error('[Gemini API failure]: Chart analysis error:', err?.message || err);
       return {
         success: false,
         fallbackUsed: true,
@@ -143,7 +186,9 @@ If precise values cannot be confidently extracted, assign a lower confidence (<0
   public async transcribeEquationToLatex(
     rawEquationText: string
   ): Promise<{ success: boolean; result?: EquationExtractionResult; fallbackUsed: boolean; error?: string }> {
-    if (!this.isAvailable || !this.ai) {
+    const client = this.ensureClient();
+    if (!client) {
+      console.log('[missing Gemini API key]: GEMINI_API_KEY not set. Using LaTeX formula template.');
       return {
         success: false,
         fallbackUsed: true,
@@ -166,7 +211,7 @@ Output JSON format:
   "confidence": 0.96
 }`;
 
-      const response = await this.ai.models.generateContent({
+      const responsePromise = client.models.generateContent({
         model: 'gemini-3.8-flash',
         contents: prompt,
         config: {
@@ -175,19 +220,30 @@ Output JSON format:
         },
       });
 
+      const response = await this.executeWithTimeout(responsePromise, 8000);
       const text = response.text || '';
-      const parsed = JSON.parse(text) as EquationExtractionResult;
-      return {
-        success: true,
-        result: parsed,
-        fallbackUsed: false,
-      };
+      try {
+        const cleaned = this.cleanJsonString(text);
+        const parsed = JSON.parse(cleaned) as EquationExtractionResult;
+        return {
+          success: true,
+          result: parsed,
+          fallbackUsed: false,
+        };
+      } catch (parseErr: any) {
+        console.error('[JSON parsing failure]: Failed to parse Gemini equation response as JSON:', parseErr?.message || parseErr);
+        return {
+          success: false,
+          fallbackUsed: true,
+          error: 'JSON parsing failure on equation response',
+        };
+      }
     } catch (err: any) {
-      console.error('Gemini equation extraction error:', err?.message || err);
+      console.error('[Gemini API failure]: Equation transcription error:', err?.message || err);
       return {
         success: false,
         fallbackUsed: true,
-        error: err?.message,
+        error: err?.message || 'Gemini equation parsing failed',
       };
     }
   }
@@ -199,7 +255,9 @@ Output JSON format:
     rawText: string,
     surroundingContext?: string
   ): Promise<{ success: boolean; result?: AmbiguousLayoutResult; fallbackUsed: boolean }> {
-    if (!this.isAvailable || !this.ai) {
+    const client = this.ensureClient();
+    if (!client) {
+      console.log('[missing Gemini API key]: No Gemini client available for ambiguous region.');
       return { success: false, fallbackUsed: true };
     }
 
@@ -217,7 +275,7 @@ Output JSON:
   "notes": "Corrected scanning artifact on signature block"
 }`;
 
-      const response = await this.ai.models.generateContent({
+      const responsePromise = client.models.generateContent({
         model: 'gemini-3.8-flash',
         contents: prompt,
         config: {
@@ -226,14 +284,22 @@ Output JSON:
         },
       });
 
+      const response = await this.executeWithTimeout(responsePromise, 8000);
       const text = response.text || '';
-      const parsed = JSON.parse(text) as AmbiguousLayoutResult;
-      return {
-        success: true,
-        result: parsed,
-        fallbackUsed: false,
-      };
-    } catch (err) {
+      try {
+        const cleaned = this.cleanJsonString(text);
+        const parsed = JSON.parse(cleaned) as AmbiguousLayoutResult;
+        return {
+          success: true,
+          result: parsed,
+          fallbackUsed: false,
+        };
+      } catch (parseErr: any) {
+        console.error('[JSON parsing failure]: Failed to parse Gemini ambiguous region response:', parseErr?.message || parseErr);
+        return { success: false, fallbackUsed: true };
+      }
+    } catch (err: any) {
+      console.error('[Gemini API failure]: Ambiguous region enrichment failed:', err?.message || err);
       return { success: false, fallbackUsed: true };
     }
   }

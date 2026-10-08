@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { DocumentBlock, DocumentItem, ParsedDocumentResult, ParserSettings } from '../types/document.js';
+import { safeParseResponse } from '../utils/api.js';
 
 export interface DocumentContextType {
   documents: DocumentItem[];
@@ -37,6 +38,15 @@ export interface DocumentContextType {
   refreshDocuments: () => Promise<void>;
 }
 
+// Helper to safely parse API responses and prevent JSON parse errors on HTML / plain text
+async function parseResponseSafely(res: Response): Promise<any> {
+  const data = await safeParseResponse(res);
+  if (!res.ok && data.success !== false) {
+    data.success = false;
+  }
+  return data;
+}
+
 const DocumentContext = createContext<DocumentContextType | null>(null);
 
 export const DocumentProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -62,7 +72,7 @@ export const DocumentProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     try {
       const res = await fetch('/api/documents');
       if (res.ok) {
-        const data = await res.json();
+        const data = await parseResponseSafely(res);
         setDocuments(data.documents || []);
       }
     } catch (err) {
@@ -74,7 +84,7 @@ export const DocumentProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     try {
       const res = await fetch('/api/settings');
       if (res.ok) {
-        const data = await res.json();
+        const data = await parseResponseSafely(res);
         setParserSettings(data.settings);
         setGeminiConnected(Boolean(data.gemini?.available));
       }
@@ -97,11 +107,11 @@ export const DocumentProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
     fetch(`/api/documents/${selectedDocumentId}/result`)
       .then(res => {
-        if (!res.ok) throw new Error('Result not found');
-        return res.json();
+        if (!res.ok) throw new Error(`Document result not found (${res.status})`);
+        return parseResponseSafely(res);
       })
       .then(data => {
-        if (isMounted) {
+        if (isMounted && data && data.result) {
           setActiveResult(data.result);
           setActivePage(1);
           setSelectedBlockId(null);
@@ -148,9 +158,11 @@ export const DocumentProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     const formData = new FormData();
     formData.append('file', file);
 
+    let stageTimer: any = null;
+
     try {
       // Simulate live stage progress visualizer
-      const stageTimer = setInterval(() => {
+      stageTimer = setInterval(() => {
         setCurrentStageIndex(prev => {
           if (prev < 10) return prev + 1;
           return prev;
@@ -163,25 +175,32 @@ export const DocumentProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         body: formData,
       });
 
-      clearInterval(stageTimer);
+      if (stageTimer) clearInterval(stageTimer);
       setUploadProgress(100);
 
-      if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.message || 'Upload failed');
+      const data = await parseResponseSafely(res);
+
+      if (!res.ok || data.success === false) {
+        const errorMsg = data?.error || data?.details || data?.message || `Upload failed with HTTP ${res.status}`;
+        throw new Error(errorMsg);
       }
 
-      const data = await res.json();
       await refreshDocuments();
 
-      if (data.resultId) {
-        setSelectedDocumentId(data.resultId);
+      // Retrieve resultId or document.id
+      const resultDocId = data.resultId || data.document?.id || data.result?.document?.id;
+      if (resultDocId) {
+        if (data.result) {
+          setActiveResult(data.result);
+        }
+        setSelectedDocumentId(resultDocId);
         setIsProcessing(false);
-        return data.resultId;
+        return resultDocId;
       }
       setIsProcessing(false);
       return null;
     } catch (err: any) {
+      if (stageTimer) clearInterval(stageTimer);
       setIsProcessing(false);
       setUploadProgress(0);
       throw err;
@@ -192,13 +211,11 @@ export const DocumentProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     setIsProcessing(true);
     try {
       const res = await fetch(`/api/documents/${id}/reprocess`, { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.result) {
-          setActiveResult(data.result);
-        }
-        await refreshDocuments();
+      const data = await parseResponseSafely(res);
+      if (data && data.result) {
+        setActiveResult(data.result);
       }
+      await refreshDocuments();
     } catch (err) {
       console.error('Reprocess error:', err);
     } finally {
@@ -208,7 +225,8 @@ export const DocumentProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
   const deleteDocument = async (id: string) => {
     try {
-      await fetch(`/api/documents/${id}`, { method: 'DELETE' });
+      const res = await fetch(`/api/documents/${id}`, { method: 'DELETE' });
+      await parseResponseSafely(res);
       if (selectedDocumentId === id) {
         setSelectedDocumentId(null);
         setActiveResult(null);
@@ -226,16 +244,14 @@ export const DocumentProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       const res = await fetch(`/api/documents/${selectedDocumentId}/blocks/${blockId}/gemini-enrich`, {
         method: 'POST',
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.updatedBlock) {
-          // Update local state block
-          const updatedBlocks = activeResult.blocks.map(b => (b.id === blockId ? data.updatedBlock : b));
-          setActiveResult({
-            ...activeResult,
-            blocks: updatedBlocks,
-          });
-        }
+      const data = await parseResponseSafely(res);
+      if (data && data.updatedBlock) {
+        // Update local state block
+        const updatedBlocks = activeResult.blocks.map(b => (b.id === blockId ? data.updatedBlock : b));
+        setActiveResult({
+          ...activeResult,
+          blocks: updatedBlocks,
+        });
       }
     } catch (err) {
       console.error('Block enrichment error:', err);
@@ -249,8 +265,8 @@ export const DocumentProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(settings),
       });
-      if (res.ok) {
-        const data = await res.json();
+      const data = await parseResponseSafely(res);
+      if (data && data.settings) {
         setParserSettings(data.settings);
       }
     } catch (err) {

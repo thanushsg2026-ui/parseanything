@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useDocuments } from '../context/DocumentContext.js';
+import { safeParseResponse } from '../utils/api.js';
 import {
   Search,
   BookOpen,
@@ -423,11 +424,11 @@ export const HelpdeskPage: React.FC<HelpdeskPageProps> = ({ navigate }) => {
     setDiagnosticsRunning(true);
     try {
       const res = await fetch('/api/support/diagnostics');
+      const data = await safeParseResponse(res);
       if (res.ok) {
-        const data = await res.json();
         setDiagnosticsData(data);
       } else {
-        setDiagnosticsData({ error: 'Diagnostics service responded with error status' });
+        setDiagnosticsData({ error: data?.details || data?.error || 'Diagnostics service responded with error status' });
       }
     } catch (err: any) {
       setDiagnosticsData({ error: err?.message || 'Failed to reach diagnostic service' });
@@ -462,8 +463,8 @@ export const HelpdeskPage: React.FC<HelpdeskPageProps> = ({ navigate }) => {
         }),
       });
 
-      if (res.ok) {
-        const data = await res.json();
+      const data = await safeParseResponse(res);
+      if (res.ok && data.success !== false) {
         setSubmittedTicket({
           id: data.ticketId,
           message: data.message,
@@ -471,8 +472,7 @@ export const HelpdeskPage: React.FC<HelpdeskPageProps> = ({ navigate }) => {
         setContactSubject('');
         setContactMessage('');
       } else {
-        const err = await res.json();
-        setFormError(err.error || 'Failed to submit support ticket.');
+        setFormError(data?.error || data?.details || 'Failed to submit support ticket.');
       }
     } catch (err: any) {
       setFormError(err?.message || 'Network error submitting support request.');
