@@ -1,0 +1,6 @@
+{
+  "name": "ParseAnything",
+  "description": "A Universal Document Parser for AI — transforms messy business documents into accurate, structured, machine-readable and citable content.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
